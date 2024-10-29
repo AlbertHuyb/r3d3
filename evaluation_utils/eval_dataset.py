@@ -16,6 +16,9 @@ from evaluation_utils.dataloader_wrapper import setup_dataloaders, SceneIterator
 from vidar.utils.setup import setup_metrics
 from r3d3.utils import pose_matrix_to_quaternion
 
+import pickle
+import cv2
+import numpy as np
 
 def load_completion_network(cfg: Config) -> DepthCompletion:
     """ Loads completion network with vidar framework
@@ -91,6 +94,18 @@ class Evaluator:
         )
 
         for timestamp, sample in enumerate(tqdm(sample_iterator, desc='Sample', position=0, leave=True)):
+            # image = sample['rgb'][0][0,0].permute(1,2,0).numpy()
+            # cv2.imwrite('/data/huyb/cvpr-2024/r3d3/logs/rgb.png', (image*255).astype(np.uint8))
+            # cv2.imwrite('/data/huyb/cvpr-2024/r3d3/logs/rgb_reverse.png', (image*255).astype(np.uint8)[:,:,::-1])
+            # # save a sample to pickle file
+            # if not os.path.exists('/data/huyb/cvpr-2024/r3d3/logs/sample.pkl'):
+            #     import pickle
+            #     with open('/data/huyb/cvpr-2024/r3d3/logs/sample.pkl', 'wb') as f:
+            #         pickle.dump(sample, f)
+            #     # save a sample to txt file for visualization
+            # with open('/data/huyb/cvpr-2024/r3d3/logs/sample.txt', 'w') as f:
+            #     f.write(str(sample))
+                
             pose = SE3(pose_matrix_to_quaternion(sample['pose'][0][0]).cuda())
             pose = pose.inv()
             pose_rel = (pose * pose[0:1].inv())
@@ -190,12 +205,186 @@ class Evaluator:
             )
             self.metrics['trajectory'].print(reduced_data, [f'scene-{scene}'])
 
+    
+    def eval_ss3dm_scene(self, town_name, seq_name, n_cams = 6):
+        output_dir = os.path.join(self.args.prediction_data_path, town_name, seq_name)
+        if os.path.exists(output_dir):
+            print("Scene {} already exists. Skipping.".format(seq_name))
+            return
+        
+        ss3dm_root = '/data/huyb/cvpr-2024/data/ss3dm/DATA'
+        seq_dir = os.path.join(ss3dm_root, town_name, seq_name)
+
+        # import pdb; pdb.set_trace()
+        target_size = [int(384/1080*1920/32)*32,384] # [W, H]
+        orig_size = [1920, 1080]
+        self.args.r3d3_image_size = [target_size[1], target_size[0]] # [H, W]
+        r3d3 = R3D3(
+            completion_net=self.completion_network,
+            n_cams=n_cams,
+            **{key.replace("r3d3_", ""): val for key, val in vars(self.args).items() if key.startswith("r3d3_")}
+        )
+        
+        ## prepare data sample for each timestep
+        meta_path = os.path.join(seq_dir, 'scenario.pt')
+        with open(meta_path, 'rb') as f:
+            meta_data = pickle.load(f)
+        
+        timestep_list = meta_data['observers']['ego_car']['data']['timestamp']
+        
+        for sample_idx, timestamp in enumerate(timestep_list):
+            # prepare data for this timestep.
+            sample = {}
+            sample['idx'] = torch.tensor([sample_idx])
+            sample['frame_idx'] = {}
+            sample['frame_idx'][0] = [torch.tensor([sample_idx])] * n_cams
+            sample['cam'] = []
+            
+            for name in meta_data['observers'].keys():
+                if 'camera' in name:
+                    sample['cam'].append([name])
+            
+            sample['filename'] = {}
+            sample['filename'][0] = []
+            for cam in sample['cam']:
+                sample['filename'][0].append([os.path.join(town_name, seq_name, 'images', cam[0], '%08d.jpg'%sample_idx)])
+            
+            sample['rgb'] = {}
+            # torch.Size([1, n_cams, 3, H, W])
+            # max = 1.0, min = 0.0
+            # dtype = float32
+            all_rgbs = []
+            for cam in sample['cam']:
+                rgb_path = os.path.join(seq_dir, 'images', cam[0], '%08d.jpg'%sample_idx)
+                # We need to reverse the image channels.
+                rgb = cv2.imread(rgb_path)
+                rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+                rgb = cv2.resize(rgb, (target_size[0], target_size[1]))
+                rgb = rgb.astype(np.float32) / 255.0
+                rgb = torch.tensor(rgb).permute(2, 0, 1).unsqueeze(0)
+                all_rgbs.append(rgb)
+            all_rgbs = torch.cat(all_rgbs, dim=0)
+            sample['rgb'][0] = all_rgbs[None,...]    
+
+            sample['intrinsics'] = {}
+            # torch.Size([1, n_cams, 3, 3])
+            intrinsics = []
+            orig_intrinsics = []
+            for cam in sample['cam']:
+                orig_intrinsic = meta_data['observers'][cam[0]]['data']['intr'][sample_idx]
+                new_intrinsic = orig_intrinsic.copy()
+                # import pdb; pdb.set_trace()
+                new_intrinsic[0,0] = orig_intrinsic[0,0] / orig_size[0] * target_size[0]
+                new_intrinsic[1,1] = orig_intrinsic[1,1] / orig_size[1] * target_size[1]
+                new_intrinsic[0,2] = orig_intrinsic[0,2] / orig_size[0] * target_size[0]
+                new_intrinsic[1,2] = orig_intrinsic[1,2] / orig_size[1] * target_size[1]
+                
+                intrinsics.append(new_intrinsic)
+                orig_intrinsics.append(orig_intrinsic)
+                
+            sample['intrinsics'][0] = torch.tensor(intrinsics).unsqueeze(0)
+            sample['raw_intrinsics'] = {}
+            sample['raw_intrinsics'][0] = torch.tensor(orig_intrinsics).unsqueeze(0)
+            
+            
+            sample['pose'] = {}
+            # torch.Size([1, n_cams, 4, 4])
+            poses = []
+            for cam in sample['cam']:
+                poses.append(meta_data['observers'][cam[0]]['data']['c2w'][sample_idx])
+            
+            sample['pose'][0] = torch.tensor(poses).unsqueeze(0)
+            
+            sample['depth'] = {}
+            # torch.Size([1, n_cams, 1, H, W])
+            # image = cv2.imread(os.path.join(args.depth_gt_dir, observer, '%.8d.png' % (i)), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+            # image = image.astype(np.float32) / 65535 * 1000.0
+            depth_images = []
+            for cam in sample['cam']:
+                depth_path = os.path.join(seq_dir, 'depth_gts', cam[0], '%08d.png'%sample_idx)
+                depth = cv2.imread(depth_path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+                depth = depth.astype(np.float32) / 65535 * 1000.0
+                depth = torch.tensor(depth).unsqueeze(0).unsqueeze(0)
+                depth_images.append(depth)
+            
+            sample['depth'][0] = torch.cat(depth_images, dim=1)
+            
+            sample['mask'] = {}
+            # torch.Size([1, n_cams, 3, H, W])
+            # all zeros
+            # import pdb; pdb.set_trace()
+            sample['mask'][0] = torch.zeros((1, n_cams, 3, all_rgbs.shape[2], all_rgbs.shape[3]))
+            
+            
+            sample['scene'] = seq_name
+            
+            
+            
+            ## The sample data is well-prepared.
+            pose = SE3(pose_matrix_to_quaternion(sample['pose'][0][0]).cuda())
+            pose = pose.inv()
+            pose_rel = (pose * pose[0:1].inv())
+
+            intrinsics = sample['intrinsics'][0][0, :, [0, 1, 0, 1], [0, 1, 2, 2]]
+            orig_intrinsics = sample['raw_intrinsics'][0][0, :, [0, 1, 0, 1], [0, 1, 2, 2]]
+            is_keyframe = 'depth' in sample and sample['depth'][0].max() > 0.
+
+            output = r3d3.track(
+                tstamp=float(timestamp),
+                image=(sample['rgb'][0][0] * 255).type(torch.uint8).cuda(),
+                intrinsics=intrinsics.cuda(),
+                mask=(sample['mask'][0][0, :, 0] > 0).cuda() if 'mask' in sample else None,
+                pose_rel=pose_rel.data
+            )
+
+            # import pdb; pdb.set_trace()
+            
+            output = {key: data.cpu() if torch.is_tensor(data) else data for key, data in output.items()}
+
+            if self.prediction_data_path is not None and output['disp_up'] is not None and is_keyframe:
+                for cam, filename in enumerate(sample['filename'][0]):
+                    depth_data = (1.0 / output['disp_up'][cam].numpy())
+                    orig_size_depth_data = cv2.resize(depth_data, (orig_size[0], orig_size[1]))
+                    # import pdb; pdb.set_trace()
+                    write_npz(
+                        os.path.join(
+                            self.prediction_data_path,
+                            filename[0] + '_depth(0)_pred.npz'
+                        ),
+                        {
+                            'depth': orig_size_depth_data,
+                            'intrinsics': orig_intrinsics[cam].numpy(),
+                            'd_info': 'r3d3_depth',
+                            't': float(timestamp)
+                        }
+                    )
+
+        # import pdb; pdb.set_trace()
+        # Terminate
+        del r3d3
+        torch.cuda.empty_cache()
+            
+    
+    def eval_datasets_ss3dm(self) -> None:
+        data_root = '/data/huyb/cvpr-2024/data/ss3dm/DATA'
+
+        for town_name in os.listdir(data_root):
+            if os.path.isdir(os.path.join(data_root, town_name)):
+                town_dir = os.path.join(data_root, town_name)
+                for seq_name in os.listdir(town_dir):
+                    if os.path.isdir(os.path.join(town_dir, seq_name)):
+                        print("Evaluating scene: {}".format(seq_name))
+                        self.eval_ss3dm_scene(town_name, seq_name)
+                        # exit(0)
+        
     def eval_datasets(self) -> None:
         """ Evaluates datasets consisting of multiple scenes
         """
         for dataloader in tqdm(self.dataloaders, desc='Datasets', position=2, leave=True):
             n_cams = len(dataloader.dataset.cameras)
+            # import pdb; pdb.set_trace()
             pbar = tqdm(SceneIterator(dataloader), desc='Scenes', position=1, leave=True)
+            # import pdb; pdb.set_trace()
             for scene, sample_iterator in pbar:
                 pbar.set_postfix_str("Processing Scene - {}".format(scene))
                 pbar.refresh()

@@ -223,6 +223,11 @@ class BaseDataset(Dataset, BaseDataLoader, ABC):
                     input_frames[i]['pose'][ctx] = np.linalg.inv(ref_pose) @ input_frames[i]['pose'][ctx]
 
         # Do Frame Transformations
+        # print(input_frames)
+        # set the masks to all zeros
+        for frame in input_frames:
+            frame['mask'] = {ctx: np.zeros_like(frame['rgb'][ctx]) for ctx in frame['rgb']}
+            
         if self.data_transform:
             input_frames = self.data_transform(input_frames)
 
@@ -247,6 +252,9 @@ class BaseDataset(Dataset, BaseDataLoader, ABC):
                 if 'points' not in input_data:
                     input_data['points'] = {}
                 input_data['points'] = self.get_points(os.path.join(self.path, group['lidar']))
+        # save input_data to a pickle file
+        with open('input_data.pickle', 'wb') as handle:
+            pickle.dump(input_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
         return input_data
 
     def with_depth(self, context: Optional[bool] = False) -> bool:

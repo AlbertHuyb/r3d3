@@ -12,4 +12,5 @@ if __name__ == '__main__':
     args = argparser()
 
     wrapper = Evaluator(args)
-    wrapper.eval_datasets()
+    # wrapper.eval_datasets()
+    wrapper.eval_datasets_ss3dm()
